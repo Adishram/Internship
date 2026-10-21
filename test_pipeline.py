@@ -4,17 +4,21 @@ All provider responses are mocked at the HTTP boundary. These tests establish
 mapping, isolation and failure handling, not real-model classification accuracy.
 """
 import copy
+import io
+import os
+import re
+import sys
 import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import pymupdf
 import requests
 
 from pipeline import (ANSWER, DECISION, Chat, Client, PipelineError, classify, export,
-                      extract, image_for_process, load_targets, selected_sections)
+                      extract, image_for_process, load_targets, selected_sections, discovered_targets)
 
 
 def fixture(path):
@@ -89,6 +93,36 @@ def router(method, url, **kwargs):
                          confidence=0.9, reason='Controlled mock response; not a real model assessment.'))
 
 
+def group_fixture(path):
+    """Use several unrelated names and page counts to test generic automatic grouping."""
+    doc = pymupdf.open()
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 16, 16), False)
+    pix.clear_with(100)
+    for name, count in [('order-check', 3), ('order-check-extended', 2), ('daily-reconciliation', 1)]:
+        for index in range(count):
+            page = doc.new_page()
+            # No special heading/close markers or server-specific fields are required.
+            page.insert_text((40, 50), f'Process: {name}')
+            page.insert_text((40, 75), 'Operation: start' if index % 2 else 'Operation: stop')
+            page.insert_image(pymupdf.Rect(40, 100, 140, 160), stream=pix.tobytes('png'))
+            page.insert_text((40, 185), f'Reference screenshot for {name}')
+    doc.save(path)
+    doc.close()
+
+
+def discovery_router(method, url, **kwargs):
+    """Mock only HTTP; return document-derived labels from real exported HTML evidence."""
+    body = kwargs['json']
+    payload = json.loads(body['messages'][1]['content'])
+    assert 'targets' not in payload
+    assert 'data:image' not in json.dumps(body)
+    assert 'image_url' not in json.dumps(body)
+    text = '\n'.join(b['text'] for b in payload['evidence']['blocks'])
+    match = re.search(r'Process: ([\w-]+)', text)
+    return response(dict(section_id=payload['evidence']['section_id'], status='assigned',
+        target=match.group(1), confidence=0.95, reason='Offline oracle: explicit Server field.'))
+
+
 class PipelineTests(unittest.TestCase):
     """Exercise real PDFs and real client validation with mocked HTTP only."""
 
@@ -150,6 +184,104 @@ class PipelineTests(unittest.TestCase):
         broken.write_text('invalid PDF')
         with self.assertRaises(PipelineError):
             preview_pdf(broken)
+
+    def test_discovery_groups_document_names_and_preserves_similar_identifiers(self):
+        """Infer multiple arbitrary groups and combine their repeated source pages."""
+        group_fixture(self.root / 'groups.pdf')
+        run = self.root / 'groups'
+        data = extract(self.root / 'groups.pdf', run)
+        with patch('pipeline.requests.request', side_effect=discovery_router):
+            decisions = classify(data, None, self.client, run)
+        targets = discovered_targets(decisions)
+        self.assertEqual(targets, ['order-check', 'order-check-extended', 'daily-reconciliation'])
+        manifest = export(data, targets, decisions, run)
+        sections = selected_sections(data, decisions, 'order-check')
+        self.assertEqual(len(sections), 3)
+        self.assertEqual({b['page'] for s in sections for b in s['blocks']}, set(range(1, 4)))
+        rendered = (run / manifest['documents']['order-check']).read_text()
+        self.assertEqual(rendered.count('<img '), 3)
+        self.assertIn('Operation: start', rendered)
+        self.assertIn('Operation: stop', rendered)
+        self.assertNotIn('order-check-extended', rendered)
+        self.assertNotIn('page 4', rendered)
+        self.assertIn('order-check', manifest['documents']['order-check'])
+        chat = Chat(data, decisions, self.client, run, manifest['documents'])
+        reply = dict(answer='No relevant text', abstain=True, citations=[])
+        with patch('pipeline.requests.request', return_value=response(reply)) as request:
+            chat.ask('order-check', 'What happened?')
+        payload = json.loads(request.call_args.kwargs['json']['messages'][1]['content'])
+        pages = {b['page'] for section in payload['evidence'] for b in section['blocks']}
+        self.assertEqual(pages, set(range(1, 4)))
+        self.assertNotIn('data:image', json.dumps(payload))
+
+    def test_discovery_rejects_invented_or_partial_names(self):
+        """A model cannot invent groups or return only a prefix of an identifier."""
+        group_fixture(self.root / 'groups.pdf')
+        run = self.root / 'groups'
+        data = extract(self.root / 'groups.pdf', run)
+        for label in ('invented-server', 'order', '../outside'):
+            answer = dict(section_id=data['sections'][0]['id'], status='assigned',
+                          target=label, confidence=1, reason='Wrong name')
+            with patch('pipeline.requests.request', return_value=response(answer)), self.assertRaisesRegex(PipelineError, 'exact identifier'):
+                classify(data, None, self.client, run)
+
+    def test_main_discovers_without_any_target_prompt(self):
+        """Default CLI flow must never ask a user to know the process names."""
+        import cli
+        group_fixture(self.root / 'groups.pdf')
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            argv = ['cli.py', '--pdf', str(self.root / 'groups.pdf'), '--no-browser']
+            with patch.object(sys, 'argv', argv), patch('cli.preview_pdf'), \
+                    patch('cli.configure', return_value=self.client), \
+                    patch('cli.prompt', side_effect=AssertionError('Unexpected manual target prompt')), \
+                    patch('pipeline.requests.request', side_effect=discovery_router):
+                cli.main()
+            manifest = json.loads(next(Path('runs').glob('*/manifest.json')).read_text())
+            self.assertEqual(manifest['targets'], ['order-check', 'order-check-extended', 'daily-reconciliation'])
+        finally:
+            os.chdir(previous)
+
+    def test_simplified_configuration_uses_router_defaults(self):
+        """Endpoint, hidden key, optional model and consent are the only setup inputs."""
+        from cli import configure
+        with patch('cli.sys.stdin.isatty', return_value=True), \
+                patch('cli.prompt', side_effect=['http://127.0.0.1:31415/v1', 'auto', 'YES']) as prompt, \
+                patch('cli.getpass', return_value='hidden-key'):
+            client = configure()
+        self.assertEqual(prompt.call_count, 3)
+        self.assertEqual((client.auth, client.mode, client.model), ('bearer', 'json_object', 'auto'))
+
+    def test_native_image_protocols_and_non_tty_fallback(self):
+        """Ghostty/Kitty use Kitty graphics; iTerm2/WezTerm use OSC 1337."""
+        from cli import image_protocol, show_image
+        path = next((self.run / 'images').glob('*.png'))
+        for program, expected in [('ghostty', 'kitty'), ('kitty', 'kitty'),
+                                  ('iTerm.app', 'iterm2'), ('WezTerm', 'iterm2')]:
+            output = io.StringIO()
+            with patch.dict(os.environ, {'TERM_PROGRAM': program}, clear=True), \
+                    patch('cli.sys.stdout', output), patch.object(output, 'isatty', return_value=True), \
+                    patch('pipeline.requests.request') as request:
+                self.assertEqual(image_protocol(), expected)
+                show_image(path)
+            self.assertIn('\x1b_G' if expected == 'kitty' else '\x1b]1337;', output.getvalue())
+            request.assert_not_called()
+        with patch('cli.sys.stdout.isatty', return_value=False):
+            self.assertIsNone(image_protocol())
+
+    def test_numbered_and_cited_images_stay_local_and_isolated(self):
+        """Image selection and answer references cannot display another group's image."""
+        from cli import images, answer_images
+        decisions = self.routed()
+        with patch('cli.show_image') as show, patch('pipeline.requests.request') as request:
+            images(self.data, decisions, 'alpha-api', self.run, selection='1')
+            self.assertEqual(show.call_count, 1)
+            answer = self.answer('beta-api')
+            # answer() uses its own mocked classifier; no request escapes that mock.
+            answer_images(self.data, decisions, 'alpha-api', self.run, answer)
+            self.assertEqual(show.call_count, 1)
+        request.assert_not_called()
 
     def test_end_to_end_layout_images_and_no_cross_process_text(self):
         decisions = self.routed()

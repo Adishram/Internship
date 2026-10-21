@@ -137,6 +137,13 @@ def extract(source: Path, run: Path, progress=lambda done, total: None) -> dict:
     return data
 
 
+def is_heading(block: dict) -> bool:
+    """Recognize explicit evidence starts without treating table values as headings."""
+    text = block['text'].strip()
+    return bool(HEADING.match(text) or (text in ('Start', 'Stop') and
+                max((span['size'] for span in block.get('spans', [])), default=0) >= 12))
+
+
 def segment(pages: list[dict]) -> tuple[list[dict], list[dict]]:
     """Use explicit starts/closes; quarantine orphan, interrupted and unclosed text.
 
@@ -144,6 +151,20 @@ def segment(pages: list[dict]) -> tuple[list[dict], list[dict]]:
     recognized page furniture is recorded separately and exported for audit.
     """
     sections, furniture, current, previous = [], [], None, None
+    marked = any(is_heading(b) for p in pages for b in p['blocks'])
+    if not marked:
+        # Ordinary PDFs need no special template: let the LLM assess one page at a time.
+        for page in pages:
+            blocks = []
+            for block in page['blocks']:
+                if block['kind'] == 'text' and FURNITURE.fullmatch(block['text'].strip()):
+                    furniture.append(block)
+                else:
+                    blocks.append(block)
+            if blocks:
+                sections.append(dict(id='s-' + blocks[0]['id'], blocks=blocks,
+                    boundary='Unmarked page; determine whether its evidence has one identity or is mixed.'))
+        return sections, furniture
 
     def finish(reason=None):
         nonlocal current
@@ -160,8 +181,7 @@ def segment(pages: list[dict]) -> tuple[list[dict], list[dict]]:
             if block['kind'] == 'text' and FURNITURE.fullmatch(text):
                 furniture.append(block)
                 continue
-            if HEADING.match(text) or (text in ('Start', 'Stop') and
-                    max((s['size'] for s in block.get('spans', [])), default=0) >= 12):
+            if is_heading(block):
                 finish('New heading before an explicit evidence-close marker.')
                 current = dict(id='s-' + block['id'], blocks=[], boundary=None)
             if current is None:
@@ -367,31 +387,73 @@ class Client:
         raise AssertionError('unreachable')
 
 
-def classify(data: dict, targets: list[str], client: Client, run: Path, progress=lambda done, total: None) -> list[dict]:
-    """Route one logical section at a time; stop immediately on systemic API failures."""
+def classify(data: dict, targets: list[str] | None, client: Client, run: Path,
+             progress=lambda done, total: None) -> list[dict]:
+    """Discover group names from HTML by default; an explicit payload restricts routing.
+
+    Discovery infers the primary process/entity from the document itself.
+    Exact source labels keep repeated records together without predefined names.
+    Unknown boundaries are passed to the model for conservative assessment, never
+    used as an excuse to assign image contents the text model cannot see.
+    """
     contexts = {s['section_id']: s for s in read_html(run / 'source.html', data['sections'], data['furniture'])}
+    discover = targets is None
+    instructions = (
+        'Discover the primary named process or entity this evidence is about, using its headings and '
+        'identifying fields. Infer the grouping level from the document; do not assume it is always '
+        'a server, service, operation or any predefined category. Copy the identifying name exactly '
+        'into target; never invent a label. All evidence for the same identity across pages belongs '
+        'in one group. Keep unrelated identities separate even when they share infrastructure. '
+        'Use known_groups for consistent naming when they refer to the same identity in this evidence; '
+        'create a new group when the evidence identifies a different entity. '
+        'If different primary identities share an inseparable section, use mixed and target null. '
+        'Boundary notes indicate possible missing context: assign only if the available text '
+        'unambiguously identifies one primary entity; otherwise use uncertain. '
+        if discover else
+        'Assign evidence by exact process/service identity to one supplied target. '
+        'Use unmatched when none of the supplied targets matches. '
+    )
+    instructions += (
+        'Start and stop records for the same identity belong together. Similar identifiers must stay separate. '
+        'Images are unseen; do not infer their contents, but preserve their references when nearby text is clear. '
+        'Use uncertain for missing or ambiguous identity. Only assigned may have a non-null target. '
+        'Copy section_id exactly. Explain the identity using source text. Confidence is an estimate.'
+    )
     decisions = []
     for i, section in enumerate(data['sections']):
-        if section['boundary'] or not any(b['kind'] == 'text' and b['text'].strip() for b in section['blocks']):
+        context = contexts[section['id']]
+        text = '\n'.join(b['text'] for b in section['blocks'] if b['kind'] == 'text')
+        boundary = section['boundary']
+        blocked = boundary and (not discover or boundary.startswith('Missing or unrelated'))
+        if blocked or not text.strip():
             result = dict(section_id=section['id'], status='uncertain', target=None, confidence=0,
-                          reason=section['boundary'] or 'Image-only evidence; process identity is unavailable in text.')
+                          reason=boundary or 'Image-only evidence; process identity is unavailable in text.')
         else:
-            result = client.complete(
-                'Assign evidence by exact process/service identity to one supplied target. Start and stop records '
-                'for the same service belong together. Similar names are different services. Images are unseen; '
-                'their presence must not block clear text classification. Use mixed for inseparable evidence of '
-                'multiple targets, unmatched for no matching target, uncertain for insufficient identity. '
-                'Only assigned may have a non-null target; copy section_id exactly. Confidence is an estimate. '
-                'Explain the identity using source text.',
-                dict(targets=targets, evidence=contexts[section['id']]), DECISION)
+            payload = dict(evidence=context, boundary_note=boundary)
+            if targets is not None:
+                payload['targets'] = targets
+            else:
+                payload['known_groups'] = discovered_targets(decisions)
+            result = client.complete(instructions, payload, DECISION)
             jsonschema.validate(result, DECISION)
+            label = result['target']
             if (result['section_id'] != section['id'] or
-                    (result['status'] == 'assigned' and result['target'] not in targets) or
-                    (result['status'] != 'assigned' and result['target'] is not None)):
+                    (result['status'] != 'assigned' and label is not None) or
+                    (result['status'] == 'assigned' and (not label or
+                        (not discover and label not in targets)))):
                 raise PipelineError('Invalid assignment: section ID or target/status pair does not match the request.')
+            if discover and result['status'] == 'assigned':
+                if (len(label) > 200 or not label.isprintable() or label != label.strip() or
+                        not re.search(r'(?<![\w.-])' + re.escape(label) + r'(?![\w.-])', text)):
+                    raise PipelineError('Discovered group name is not an exact identifier in its evidence text.')
         decisions.append(result)
         progress(i + 1, len(data['sections']))
     return decisions
+
+
+def discovered_targets(decisions: list[dict]) -> list[str]:
+    """Return each LLM-assigned group once, retaining first-appearance order."""
+    return list(dict.fromkeys(d['target'] for d in decisions if d['status'] == 'assigned'))
 
 
 def selected_sections(data: dict, decisions: list[dict], target: str | None) -> list[dict]:
@@ -452,7 +514,8 @@ def export(data: dict, targets: list[str], decisions: list[dict], run: Path, sta
             raise PipelineError('Export refused: inconsistent target/status pair.')
     documents = {}
     for i, target in enumerate(targets, 1):
-        name = f'process-{i:02d}.html'
+        slug = re.sub(r'[^a-z0-9]+', '-', target.lower()).strip('-')[:60] or 'group'
+        name = f'process-{i:02d}-{slug}.html'
         documents[target] = name
         (run / name).write_text(html_document(target, data, selected_sections(data, decisions, target), run))
     (run / 'withheld.html').write_text(html_document('Withheld evidence', data, selected_sections(data, decisions, None), run))

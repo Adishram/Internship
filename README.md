@@ -1,7 +1,7 @@
 # Evidence Splitter
 
 A small Python terminal application that converts PDF evidence into positioned HTML,
-asks a text model to route logical sections to your exact process labels, and provides
+asks a text model to discover and group process/entity evidence automatically, and provides
 process-isolated Q&A with checked citations from the selected process HTML file. Images remain local throughout model calls.
 
 The original brief and detailed requirements remain unchanged in [HANDOFF.md](HANDOFF.md).
@@ -33,51 +33,52 @@ an AI-generated summary. Kitty/iTerm2 terminals also show a first-page thumbnail
 terminals offer to open the original PDF in the system viewer. Previewing makes no
 network requests and happens before credentials are collected.
 
-Enter your hosted API base URL or full chat-completion URL. There is no localhost
-default and no required `/v1` suffix. The API must accept the OpenAI chat-completions
-request/response format and your chosen structured-response mode.
+Enter your API URL, enter the API key at the hidden prompt, and enter a model ID.
+For routers with automatic selection, press Enter at the model prompt. `/models`
+can list available model IDs. Approve sending document text to that service.
 
-- `auto` URL type recognizes a URL ending in `/chat/completions`; otherwise it appends
-  `/chat/completions` to the supplied base path.
-- `base` explicitly uses a base URL; `chat` sends directly to a full custom URL.
-- Query parameters such as `api-version` are preserved after the route.
-- Choose `bearer` authentication for an Authorization Bearer token, or `api-key` for
-  services that require that header. Enter the key/token at the hidden prompt.
+The LLM then discovers the groups automatically. **You do not need to type process
+names or supply a target payload.** The LLM reads section headings and identifying
+fields to infer which named process/entity each piece of evidence belongs to. The
+code contains no predefined process names or fixed preference for server versus
+service names. Repeated evidence for the same identity is collected across pages;
+start, stop and verification records stay together. Similar or unrelated identities
+remain separate. Discovered names must occur exactly in the source evidence, and
+previously discovered names are provided to keep naming consistent across sections.
 
-Examples of URL formats:
+After processing, the terminal lists every created group and its HTML path. Select
+a number or group name to chat. `/ls` lists the generated files again. The model
+receives only the selected group's HTML evidence and its own conversation history.
+Reference images attached to cited sections are displayed locally after answers.
 
-| Input | URL type | Chat URL used |
-| --- | --- | --- |
-| `https://api.example.com/v1` | `auto` | `https://api.example.com/v1/chat/completions` |
-| `https://api.example.com/openai/v1` | `auto` | `https://api.example.com/openai/v1/chat/completions` |
-| `https://api.example.com/custom/inference?api-version=VERSION` | `chat` | Used exactly as entered |
+Normal API defaults are Bearer authentication, automatic URL interpretation and
+`json_object` responses. For FreeLLMAPI, enter the router's **unified key**; the default
+Bearer header is appropriate. These advanced flags are available if your API needs them:
 
-Enter an exact model/deployment ID. `/models` attempts the API's catalog route when
-it can be inferred; some services do not expose one, so use an explicit ID there.
-`/auto` is optional routing offered by some routers, not a universal model name.
-Choose `json_object` or `json_schema` according to the provider/model's support.
-The program asks for disclosure consent before making any network request. Hosted
-and local routers can forward document text to upstream services.
+```sh
+python cli.py --auth api-key --response-format json_schema --url-type chat
+```
 
-Any hosted HTTPS URL using this compatible format can be configured; provider-specific
-native APIs with different JSON formats need an adapter or compatible gateway.
-URL flexibility does not imply that every provider/model implements this contract.
+Any hosted HTTPS base URL or full OpenAI-compatible chat-completion URL is accepted;
+HTTP is also supported for loopback routers. No `/v1` suffix is forced. `--url-type chat`
+uses a custom full URL directly, and query parameters such as `api-version` are preserved.
+A provider using a different native JSON protocol needs a compatible gateway or adapter.
+`auto` as a model name requires router support; direct providers need an exact model ID.
 
-Load `targets.example.json`, supply another JSON payload, or choose `/enter` to type
-process names. At least two distinct names are required; additional targets work too.
-The example labels are `springboot-web` and `springboot-relay`. Replace them with your
-actual desired process labels; the program does not silently discover or change targets.
-Service start and stop records route to the same process label.
+For an explicit fixed list of service/process targets instead of discovery, supply
+`--payload targets.example.json`. This optional mode preserves exact supplied labels
+and keeps different services separate even if they share a server. It is not part
+of the default interactive workflow.
 
 To convert and inspect everything without an API key or any network calls:
 
 ```sh
-.venv/bin/python cli.py --pdf "/path/to/evidence.pdf" --payload targets.example.json --extract-only
+.venv/bin/python cli.py --pdf "/path/to/evidence.pdf" --extract-only
 ```
 
 Add `--no-browser` to exit after writing the files. Here “browser” means the terminal
 document menu; it does not automatically launch a web browser. Local-only exports
-mark all evidence as unclassified and leave target documents empty.
+mark all evidence as unclassified; no discovered process files are created without a model.
 
 Each run creates `runs/<timestamp>/`:
 
@@ -85,7 +86,7 @@ Each run creates `runs/<timestamp>/`:
 | --- | --- |
 | `source.html` | Full PDF converted to positioned HTML before classification |
 | `index.html` | Links to every target and review document, plus all decision reasons |
-| `process-01.html`, etc. | Independent HTML containing only assigned source evidence |
+| `process-01-group-name.html`, etc. | Independent HTML containing only assigned source evidence |
 | `withheld.html` | Uncertain, mixed, unmatched or not-yet-classified evidence |
 | `furniture.html` | Recognized document headers/footers, retained for audit |
 | `manifest.json` | Source hashes, original pages, positions, section/block/line IDs and decisions |
@@ -104,7 +105,7 @@ provides the results table and index. Inside a document:
 | --- | --- |
 | `/ls` | List every process HTML file, label, size and assigned-section count |
 | `/evidence` | Show source text, section chunk numbers, line/block IDs and original pages |
-| `/images` | List local image references and adjacent text, then select an image |
+| `/images` or `/images 1` | List numbered local references or immediately show one |
 | `/html` | Open this document in the system browser |
 | `/chunk N` | Explicitly limit chat to one section, with a separate history |
 | `/all` | Restore full-process chat scope |
@@ -120,10 +121,17 @@ and an exact nonempty source quote. Foreign or fabricated citations cause absten
 **Citation validity does not prove every paraphrase is accurate.** Inspect the quoted
 text and original evidence when correctness matters.
 
-Kitty and iTerm2 graphics protocols are supported locally. Other terminals display
-the image path and offer to open the system image viewer. A missing or foreign image
-ID fails locally without an API request. Actual graphics rendering still needs testing
-in a compatible terminal; plain terminal output is not claimed to display an image.
+Ghostty and Kitty use native Kitty graphics; iTerm2 and WezTerm use inline image
+escapes. `/images 1` shows the first image in the selected group immediately, or
+say “show me the reference image” to choose one. Answer citations also display their
+associated reference images automatically. All image resolution is local and scoped
+to the selected group; image bytes never enter LLM requests.
+
+Plain terminals cannot display actual inline images. In that case the CLI gives the
+local image path and offers the system viewer when selecting `/images`. Use a compatible
+terminal for native display. Multiplexers may block graphics; run directly in the terminal,
+or set `EVIDENCE_IMAGE_PROTOCOL=kitty` or `iterm2` only if your setup supports passthrough.
+Protocol output is covered by tests; visual rendering requires a compatible terminal.
 
 Ctrl-C cancels the workflow. Conversion is exported before classification begins, so
 a provider failure or cancellation leaves a local review document. No partial routing
@@ -153,10 +161,12 @@ Filenames like `Synthetic_Server_Data_pages_11-20.pdf` preserve source offsets.
 Sections continue across contiguous pages within the selected PDF. A page slice
 can be supplied as a single PDF, but missing context remains quarantined.
 
-Segmentation recognizes the supplied evidence headings and explicit close markers.
+Segmentation recognizes explicit evidence headings and close markers when present.
 Line-level IDs handle headings that share a PDF block with introductory prose. Standalone
-large `Start`/`Stop` headings are also recognized. Orphans, missing pages, interrupted
-sections and unclosed endings are quarantined. The furniture allowlist is explicit;
+large `Start`/`Stop` headings are also recognized. Without these markers, each page
+is a candidate section. Discovery sends boundary notes to the model and requires it
+to withhold ambiguous/mixed identity; missing-page continuations remain quarantined.
+Optional fixed-target mode retains strict boundary quarantine. The furniture allowlist is explicit;
 there is no generic “remove repeated bottom rows” rule. Every extracted text/image
 unit belongs to a section or the auditable furniture collection.
 
@@ -178,10 +188,10 @@ they are never silently split or dropped.
 
 ## Limits and design choices
 
-This baseline is tailored to the supplied structured PDFs. New document layouts may
-need explicit heading/close-marker rules in `pipeline.py`. Unmarked continuations,
-interleaved columns and unusual reading orders cannot be inferred reliably. Review
-quarantined evidence rather than treating it as automatically classified.
+Ordinary unmarked pages are evaluated by the model for identity. Pages containing
+inseparable evidence for multiple groups are withheld instead of duplicated. New
+complex layouts may benefit from additional section boundary rules in `pipeline.py`;
+interleaved columns and ambiguous continuations still require review.
 
 Text spans and raster image positions are retained, with browser font fallbacks.
 Vector drawings, embedded fonts, rotated text and complex PDF transformations are not
@@ -192,7 +202,7 @@ source PDF before using their classification downstream.
 
 The preserved 52-page dataset was used for the initial offline verification. The
 application has no dependency on that dataset or its local directory. The test
-generator creates a smaller known-label fixture rather than a new 30–40-page mock. Automatic process discovery and a web UI are intentionally outside this baseline.
+generator creates a smaller known-label fixture rather than a new 30–40-page mock. Automatic group discovery is the default; a web UI is outside this baseline.
 
 Implementation references: [PyMuPDF extraction documentation](https://pymupdf.readthedocs.io/en/latest/app1.html)
 explains the positioned text/image representation and HTML layout caveats;
@@ -203,7 +213,7 @@ OpenAI-compatible base path; [Azure REST authentication and versioning](https://
 documents Bearer/`api-key` authentication and `api-version` query parameters.
 Model IDs and endpoint availability are runtime configuration, not hardcoded assumptions.
 
-## Tests and verification report — 13 October 2026
+## Tests and verification report — 21 October 2026
 
 ```sh
 .venv/bin/python -m unittest -v test_pipeline
@@ -219,9 +229,14 @@ Its exact targets are `alpha-api` and `beta-api`. It includes a mixed-process pa
 a cross-page continuation, repeated table rows, images, mixed and unmatched sections,
 and orphan/unknown evidence. Tests generate it in temporary directories automatically.
 
-- Offline regression suite: **35 tests passed**. Tests exercise
+- Offline regression suite: **41 tests passed**. Tests exercise
   real PDF extraction/export and mock only HTTP responses. Request bodies are inspected
   for text-only content, selected-process isolation and absence of image data/paths.
+- Automatic grouping: arbitrary process names across different page counts
+  produce separate groups with all original images. CLI tests prove there is no manual
+  target prompt; invented/partial labels fail validation. All responses are mocked.
+- Native image protocols: Ghostty/Kitty and iTerm2/WezTerm escape output, numbered
+  references and isolation are tested without network calls.
 - HTML grounding: classification reads the source HTML, chat reads only the selected
   process HTML, and missing/edited/swapped documents are rejected before HTTP.
 - Hosted API configuration: base paths, full/custom chat URLs, trailing slashes,
@@ -232,14 +247,14 @@ and orphan/unknown evidence. Tests generate it in temporary directories automati
   locally and reports corrupt PDFs before model configuration.
 - Preserved dataset (initial directory-based verification before single-PDF input): **52 pages, 102 logical sections, 102 extracted images** verified
   locally. The first 100 sections have explicit boundaries. The final two lack close
-  markers and remain quarantined. Counts are not classification ground truth.
+  markers; discovery now asks the model to assess their available text and boundary notes. Counts are not classification ground truth.
 - Error coverage includes invalid JSON/schema, wrong IDs, inconsistent assignments,
   missing/duplicate decisions, provider/auth/quota errors, redirects, context overflow,
   foreign images/citations, fabricated quotes and incorrect source pages.
 - Interactive PTY smoke checks: hidden key input did not echo the dummy key; consent
   refusal stopped before network access. A mocked classification run showed real page/section
   progress and accessible process menus. Local image fallback, process switching and
-  cancellation were also checked. Kitty/iTerm2 graphics and a live-provider waiting
+  cancellation were also checked. Actual on-screen graphics rendering and a live-provider waiting
   spinner were not visually verified.
 - Live provider classification: **not run**. No document text was disclosed during
   development. Real routing quality and provider-specific structured output compatibility
