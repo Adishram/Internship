@@ -358,6 +358,8 @@ def browse(data, decisions, targets, manifest, run, client):
                         continue
                     with CONSOLE.status('Waiting for a cited text answer…'):
                         answer = chat.ask(target, command, chunk)
+                    if chat.last_notice:
+                        say(chat.last_notice.strip())
                     say(answer['answer'])
                     for citation in answer['citations']:
                         say(f'{citation["section_id"]} / {citation["block_id"]}, source page {citation["page"]}: "{citation["quote"]}"')
@@ -374,15 +376,20 @@ def main():
     parser.add_argument('--auth', choices=['bearer', 'api-key'], default='bearer', help='Advanced: authentication header')
     parser.add_argument('--response-format', choices=['json_object', 'json_schema'], default='json_object', help='Advanced: provider JSON mode')
     parser.add_argument('--url-type', choices=['auto', 'base', 'chat'], default='auto', help='Advanced: API URL interpretation')
+    parser.add_argument('--context-chars', type=int, default=24000, help='Serialized request character budget (not tokens)')
     parser.add_argument('--extract-only', action='store_true', help='Convert and export locally; never configure or call a model')
     parser.add_argument('--no-browser', action='store_true', help='Exit after writing output files')
     args = parser.parse_args()
+    if args.context_chars < 4000:
+        raise PipelineError('--context-chars must be at least 4000.')
     say('Evidence Splitter\nChoose PDF → preview → configure text model → convert → discover groups → inspect → chat/view images')
     start = time.monotonic()
     source = select_pdf(args.pdf)
     preview_pdf(source)
     targets = load_targets(args.payload.expanduser()) if args.payload else None
     client = None if args.extract_only else configure(args.auth, args.response_format, args.url_type)
+    if client:
+        client.budget = args.context_chars
     say('The LLM will discover process groups from the PDF text.' if targets is None
         else 'Routing to the labels in the supplied payload.')
     run = Path('runs') / datetime.now().strftime('%Y%m%d-%H%M%S-%f')

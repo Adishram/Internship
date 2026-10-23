@@ -434,6 +434,70 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             chat.ask('beta-api', 'test', chunk=999)
 
+    def test_chat_batches_all_evidence_and_bounds_history(self):
+        """Large groups still answer; every source unit is visited and no other group leaks."""
+        chat = self.chat()
+        self.client.budget = 3600
+        seen, requests_seen = [], []
+        def oracle(method, url, **kwargs):
+            body = kwargs['json']
+            self.assertLessEqual(len(json.dumps(body['messages'], ensure_ascii=False)), self.client.budget)
+            payload = json.loads(body['messages'][1]['content'])
+            requests_seen.append(payload)
+            self.assertNotIn('beta-api', json.dumps(body))
+            for section in payload['evidence']:
+                seen.extend(b['id'] for b in section['blocks'])
+            section = payload['evidence'][0]
+            block = next((b for c in payload['evidence'] for b in c['blocks']
+                          if b['text'] != '[Local image reference; pixels not provided]' and b['text'].strip()), None)
+            if block is None:
+                return response(dict(answer='', abstain=True, citations=[]))
+            owner = next(c for c in payload['evidence'] if block in c['blocks'])
+            return response(dict(answer=block['text'], abstain=False, citations=[dict(
+                section_id=owner['section_id'], block_id=block['id'], page=block['page'], quote=block['text'])]))
+        with patch('pipeline.requests.request', side_effect=oracle):
+            result = chat.ask('alpha-api', 'Describe the evidence')
+        expected = [b['id'] for c in selected_sections(self.data, chat.decisions, 'alpha-api') for b in c['blocks']]
+        self.assertCountEqual(seen, expected)
+        self.assertGreater(len(requests_seen), 1)
+        self.assertFalse(result['abstain'])
+        self.assertIn('batches', chat.last_notice)
+        # An oversized old answer cannot make every future question fail.
+        chat.histories[('alpha-api', None)] = [dict(question='old', response='x' * 20000)]
+        with patch('pipeline.requests.request', side_effect=oracle):
+            self.assertFalse(chat.ask('alpha-api', 'Describe the evidence')['abstain'])
+        self.assertIn('recent', chat.last_notice)
+
+    def test_chat_resolves_unique_parent_citation_and_repairs_wrong_quote(self):
+        """Providers using the parent ID can be resolved only by exact source evidence."""
+        chat = self.chat()
+        answer = self.answer()
+        citation = answer['citations'][0]
+        block = next(b for s in self.data['sections'] for b in s['blocks'] if b['id'] == citation['block_id'])
+        citation['block_id'] = block['block_id']
+        with patch('pipeline.requests.request', return_value=response(answer)):
+            result = chat.ask('alpha-api', 'State?')
+        self.assertFalse(result['abstain'])
+        self.assertEqual(result['citations'][0]['block_id'], block['id'])
+        wrong = self.answer()
+        wrong['citations'][0]['quote'] = 'invented'
+        with patch('pipeline.requests.request', side_effect=[response(wrong), response(self.answer())]) as request:
+            self.assertFalse(chat.ask('alpha-api', 'State?')['abstain'])
+        self.assertEqual(request.call_count, 2)
+
+    def test_compound_question_can_return_supported_part(self):
+        """A valid partial answer is shown instead of requiring every requested fact."""
+        chat = self.chat()
+        answer = self.answer()
+        answer['answer'] = 'Active state is documented. A stop is not established by the supplied text.'
+        with patch('pipeline.requests.request', return_value=response(answer)) as request:
+            result = chat.ask('alpha-api', 'Was it active and then stopped?')
+        self.assertFalse(result['abstain'])
+        self.assertIn('not established', result['answer'])
+        system = request.call_args.kwargs['json']['messages'][0]['content']
+        self.assertIn('answer each supported part', system)
+        self.assertIn('Distinguish services/entities', system)
+
     def test_invalid_json_bounded_correction(self):
         bad = response(None)
         bad.json.return_value['choices'][0]['message']['content'] = 'prose {"answer": "bad"}'

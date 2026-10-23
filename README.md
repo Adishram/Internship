@@ -1,5 +1,7 @@
 # Evidence Splitter
 
+Detailed Python engineering handover: [PYTHON_MAINTENANCE.md](PYTHON_MAINTENANCE.md).
+
 A small Python terminal application that converts PDF evidence into positioned HTML,
 asks a text model to discover and group process/entity evidence automatically, and provides
 process-isolated Q&A with checked citations from the selected process HTML file. Images remain local throughout model calls.
@@ -181,10 +183,22 @@ timeouts, and validate structured results locally. Invalid JSON/schema gets one
 correction attempt; invalid identities and provider errors stop the run. No raw provider
 error bodies or tracebacks are printed. A 24,000-character serialized message budget
 bounds context conservatively; it is **not a tokenizer or a guarantee for every model**.
-Overflow fails without truncation. In chat, use `/evidence` then `/chunk N` to explicitly
-inspect a smaller scope, or `/clear` for excessive history. Oversized individual sections
-require adjusting evidence boundaries or configuring a suitable budget in `Client`;
-they are never silently split or dropped.
+Classification overflow fails without truncation. Chat visits all selected evidence in
+bounded batches when needed, preserving original IDs. Answers are explicitly scoped
+and quoted; they are not synthesized into a global conclusion. Conversation history
+is bounded to four recent turns and a quarter of the context budget, with a notice
+when history is reduced. No source evidence is silently discarded.
+
+Use `--context-chars N` to configure the request-character budget for your model.
+An oversized individual line/question fails clearly: use `/clear`, shorten the
+question, select `/chunk N`, or increase the budget within model limits.
+Questions with several parts can receive a cited answer for the supported parts
+while explicitly identifying missing evidence. One missing event does not suppress
+a separately documented event. Citation errors get one bounded correction; foreign
+or fabricated references still cause abstention.
+
+The final allocation optimizations were not executed or retested, as requested.
+Earlier offline verification is recorded in the Python handover.
 
 ## Limits and design choices
 
@@ -213,7 +227,7 @@ OpenAI-compatible base path; [Azure REST authentication and versioning](https://
 documents Bearer/`api-key` authentication and `api-version` query parameters.
 Model IDs and endpoint availability are runtime configuration, not hardcoded assumptions.
 
-## Tests and verification report — 21 October 2026
+## Historical tests and verification report — before final optimization edits
 
 ```sh
 .venv/bin/python -m unittest -v test_pipeline
@@ -229,7 +243,7 @@ Its exact targets are `alpha-api` and `beta-api`. It includes a mixed-process pa
 a cross-page continuation, repeated table rows, images, mixed and unmatched sections,
 and orphan/unknown evidence. Tests generate it in temporary directories automatically.
 
-- Offline regression suite: **41 tests passed**. Tests exercise
+- Offline regression suite: **44 tests passed on the earlier snapshot**. Tests exercise
   real PDF extraction/export and mock only HTTP responses. Request bodies are inspected
   for text-only content, selected-process isolation and absence of image data/paths.
 - Automatic grouping: arbitrary process names across different page counts
