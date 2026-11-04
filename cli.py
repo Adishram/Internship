@@ -13,12 +13,15 @@ import subprocess
 import tempfile
 import sys
 import time
+import unicodedata
 
 import pymupdf
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn, TimeElapsedColumn
 from rich.table import Table
+
+from ocr import OCRError, TesseractOCR
 
 from pipeline import (Chat, Client, PipelineError, classify, export, extract, image_for_process,
                       load_targets, selected_sections, validate_pdf, discovered_targets)
@@ -28,7 +31,7 @@ CONSOLE = Console(markup=False, highlight=False)
 
 def safe(text):
     """Prevent source evidence or model text from injecting terminal control sequences."""
-    return ''.join(c for c in str(text) if c in '\n\t' or (ord(c) >= 32 and ord(c) != 127))
+    return ''.join(c for c in str(text) if c in '\n\t' or unicodedata.category(c) not in ('Cc', 'Cf'))
 
 
 def say(text):
@@ -138,7 +141,8 @@ def configure(auth='bearer', mode='json_object', endpoint_kind='auto'):
     key = getpass('API key or token (hidden; never saved): ')
     model = prompt('Model ID, or Enter for router auto-selection (/models lists models)', 'auto')
     say('Classification and chat send evidence to the configured API, which may forward to upstream providers: '
-        'extracted document text and selected-group conversation text. Images stay local.')
+        'extracted PDF text, locally recognized screenshot text and selected-group conversation text. '
+        'Image pixels stay local; their recognized text is sent when used as evidence.')
     if prompt('Approve this disclosure to the configured service? Type YES') != 'YES':
         raise PipelineError('Disclosure not approved. Use --extract-only to inspect local conversion.')
     client = Client(endpoint, key, model, mode=mode, consent=True, endpoint_kind=endpoint_kind, auth=auth)
@@ -177,7 +181,7 @@ def stage(label, function):
 
 def results(data, decisions):
     """Show every decision with original pages and an uncalibrated confidence estimate."""
-    table = Table(title='Routing results — confidence is a model estimate')
+    table = Table(title='Routing results — header ownership or model estimate; not OCR accuracy')
     for heading in ('Section', 'Pages', 'Process', 'Status', 'Confidence', 'Reason'):
         table.add_column(heading, overflow='fold')
     sections = {s['id']: s for s in data['sections']}
@@ -193,7 +197,11 @@ def evidence(sections):
     for number, section in enumerate(sections, 1):
         say(f'\nChunk {number}: {section["id"]}')
         for b in section['blocks']:
-            say(f'  [{b["id"]}, source page {b["page"]}] {b["text"] if b["kind"] == "text" else "LOCAL IMAGE"}')
+            origin = (f'OCR score={b["confidence"]:.1f}, '
+                      f'{"eligible" if b["usable"] else "WITHHELD from model"}, image={b["image_id"]}'
+                      if b.get('origin') == 'ocr' else 'PDF text' if b['kind'] == 'text'
+                      else f'LOCAL IMAGE; OCR={b.get("ocr_status", "disabled")}')
+            say(f'  [{b["id"]}, source page {b["page"]}, {origin}] {b["text"]}')
 
 
 def show_image(path: Path, offer_viewer=True):
@@ -261,13 +269,21 @@ def images(data, decisions, target, run, selection=None):
 
 
 def answer_images(data, decisions, target, run, answer):
-    """Display source images attached to cited sections, scoped to the current group."""
-    cited = {c['section_id'] for c in answer['citations']}
-    for section in selected_sections(data, decisions, target):
-        if section['id'] not in cited:
-            continue
+    """Show exact OCR source screenshots; use cited pages for PDF-text-only answers."""
+    sections = selected_sections(data, decisions, target)
+    lookup = {(s['id'], b['id']): b for s in sections for b in s['blocks']}
+    image_ids, cited_pages = set(), set()
+    for citation in answer['citations']:
+        block = lookup.get((citation['section_id'], citation['block_id']))
+        if block:
+            if block.get('image_id'):
+                image_ids.add(block['image_id'])
+            else:
+                cited_pages.add((citation['section_id'], block['page']))
+    for section in sections:
         for block in section['blocks']:
-            if block['kind'] == 'image':
+            if block['kind'] == 'image' and (block['id'] in image_ids or
+                    (not image_ids and (section['id'], block['page']) in cited_pages)):
                 say(f'Reference image: source page {block["page"]} | {block["id"]}')
                 show_image(image_for_process(data, decisions, target, block['id'], run), offer_viewer=False)
 
@@ -379,34 +395,70 @@ def main():
     parser.add_argument('--context-chars', type=int, default=24000, help='Serialized request character budget (not tokens)')
     parser.add_argument('--extract-only', action='store_true', help='Convert and export locally; never configure or call a model')
     parser.add_argument('--no-browser', action='store_true', help='Exit after writing output files')
+    parser.add_argument('--ocr', choices=['on', 'off'], default='on', help='Local Tesseract screenshot OCR (default: on)')
+    parser.add_argument('--ocr-language', default='eng', help='Installed Tesseract language, e.g. eng or eng+deu')
+    parser.add_argument('--ocr-psm', type=int, choices=[3, 6, 11], default=6,
+                        help='OCR layout: 6 for terminal text, 3 automatic, 11 sparse text')
+    parser.add_argument('--ocr-min-confidence', type=float, default=60,
+                        help='Minimum score for EVERY word in a model-eligible OCR line (0–100)')
+    parser.add_argument('--ocr-timeout', type=int, default=45, help='Seconds per image; range 1–300')
+    parser.add_argument('--tesseract', default='tesseract', help='Tesseract executable name or path')
+    parser.add_argument('--tessdata-dir', help='Optional directory containing installed language traineddata')
+    parser.add_argument('--layout', choices=['auto', 'headers', 'legacy'], default='auto',
+                        help='Carry native process headings across pages, or use older evidence-section markers')
+    parser.add_argument('--header-pattern', help='Full-match native-heading regex with a named (?P<process>...) group')
     args = parser.parse_args()
     if args.context_chars < 4000:
         raise PipelineError('--context-chars must be at least 4000.')
-    say('Evidence Splitter\nChoose PDF → preview → configure text model → convert → discover groups → inspect → chat/view images')
+    if args.header_pattern:
+        try:
+            pattern = re.compile(args.header_pattern)
+        except re.error:
+            raise PipelineError('Invalid --header-pattern regular expression.') from None
+        if 'process' not in pattern.groupindex:
+            raise PipelineError('--header-pattern must contain a named (?P<process>...) group.')
+    say('Evidence Splitter\nChoose PDF → local OCR → process HTML → inspect → grounded chat/reference images')
     start = time.monotonic()
     source = select_pdf(args.pdf)
+    try:
+        ocr = (TesseractOCR(args.tesseract, args.ocr_language, args.ocr_psm,
+                            args.ocr_min_confidence, args.ocr_timeout, args.tessdata_dir)
+               if args.ocr == 'on' else None)
+    except OCRError as error:
+        raise PipelineError(str(error)) from None
     preview_pdf(source)
     targets = load_targets(args.payload.expanduser()) if args.payload else None
     client = None if args.extract_only else configure(args.auth, args.response_format, args.url_type)
     if client:
         client.budget = args.context_chars
-    say('The LLM will discover process groups from the PDF text.' if targets is None
+    say('Native process headings own continuation pages; unheaded legacy sections use model discovery.' if targets is None
         else 'Routing to the labels in the supplied payload.')
     run = Path('runs') / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     say(f'Output folder: {run.resolve()}')
-    data = stage('Converting pages', lambda progress: extract(source, run, progress))
+    data = stage('Converting pages and reading screenshots' if ocr else 'Converting pages',
+                 lambda progress: extract(source, run, progress, ocr=ocr, layout=args.layout,
+                                          header_pattern=args.header_pattern))
     say(f'Extracted {len(data["pages"])} pages and {len(data["sections"])} sections.')
+    ocr_lines = [b for page in data['pages'] for b in page['blocks'] if b.get('origin') == 'ocr']
+    image_blocks = [b for page in data['pages'] for b in page['blocks'] if b['kind'] == 'image']
+    say(f'OCR: {sum(b["usable"] for b in ocr_lines)} eligible lines; '
+        f'{sum(not b["usable"] for b in ocr_lines)} unreliable lines retained for inspection.')
+    incomplete = sum(b.get('ocr_status') != 'recognized' for b in image_blocks)
+    if incomplete:
+        say(f'{incomplete} image(s) have incomplete, unavailable or disabled OCR. Inspect their screenshots; '
+            'missing recognized text is not evidence that an event did not happen.')
     decisions = [dict(section_id=s['id'], status='uncertain', target=None, confidence=0,
                       reason=s['boundary'] or 'Not classified; local extraction only.') for s in data['sections']]
     manifest = export(data, targets or [], decisions, run, state='not classified')
-    if client:
+    if client or any(s.get('header') for s in data['sections']):
         try:
-            decisions = stage('Discovering groups' if targets is None else 'Classifying sections', lambda progress: classify(data, targets, client, run, progress))
+            decisions = stage('Routing evidence', lambda progress: classify(data, targets, client, run, progress))
         except (PipelineError, KeyboardInterrupt):
             say(f'Classification stopped. Local evidence remains available at {run.resolve() / "index.html"}. No partial routing was published.')
             raise
         targets = discovered_targets(decisions) if targets is None else targets
-        manifest = export(data, targets, decisions, run)
+        manifest = export(data, targets, decisions, run, state='complete' if client or
+                          all(s.get('header') for s in data['sections']) else 'local header routing; other evidence withheld')
     results(data, decisions)
     list_process_html(manifest, run)
     say(f'Finished in {time.monotonic() - start:.1f}s. Review: {run.resolve() / "index.html"}')

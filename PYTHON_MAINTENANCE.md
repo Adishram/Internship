@@ -1,406 +1,211 @@
-# Python implementation: engineering and internship handover
+# Evidence Splitter: Python implementation handbook
 
-Updated 23 October 2026. Read this alongside `pipeline.py`, `cli.py`, and
-`test_pipeline.py`. This document describes the implementation, including the chat
-changes made during this handover. `HANDOFF.md` is historical context: later user
-requirements supersede its fixed-target default and its earlier exclusion of Rust.
-The Python implementation is retained as an independently runnable reference.
+Updated 4 November 2026. This is the reference for the Python application, including local OCR and heading-led documents. The separate Rust application is not the implementation described here. Names in examples are illustrative, never built-in routing targets.
 
-## Current delivery status
+## Purpose and trust boundary
 
-The final code changes were not built, tested or benchmarked, following the user's
-instruction. Earlier test results describe the preceding snapshot, not the final
-allocation optimization edits. Python chat packing now extends batches in place,
-rolling back only the overflowing unit, while retaining exact budget checks. Each
-completion reuses a Draft 2020-12 schema validator across its bounded attempts.
-Invalid context-budget flags are rejected before preview/provider configuration.
-Rust implementation and its consolidated HTML handover are maintained separately
-under `rust/`; publication of this Python handover does not publish that directory.
+The application accepts one PDF, preserves its native text and embedded raster images, transcribes those images locally, and produces separate HTML evidence files for named processes. A user chooses a process before asking questions. The text API receives only the selected HTML's verified textual evidence, never image pixels. It must cite that evidence or abstain.
 
-## 1. Purpose, current contract, and boundaries
+A valid citation proves that a quotation exists in the selected source; it does **not** prove that the answer logically follows from it. OCR confidence is not a probability of truth. Source documents themselves may be wrong. These distinctions are essential when describing the application to clients.
 
-The application turns one PDF into HTML, asks a configured text LLM to classify
-logical evidence sections, exports one independent HTML per discovered group,
-and answers questions using only the selected group's exported evidence.
+## Architecture and responsibilities
 
-The default interaction is: PDF path → local preview → API configuration and
-consent → conversion → automatic grouping → process list → questions/images.
-Users do not need to name processes in advance. `--payload` is an optional
-restriction to supplied names. Names and grouping levels come from document text;
-there are no hardcoded production process names. The server/service distinction
-matters: a model may choose a host as the primary entity, and that group can then
-contain multiple services. Review this interpretation before downstream use.
+```text
+PDF path
+  → PyMuPDF native text + embedded raster images
+  → local Tesseract → OCR lines, word scores and image coordinates
+  → native heading boundaries / legacy sections
+  → source.html → integrity-checked text
+  → deterministic heading ownership OR legacy API classification
+  → process HTML files + withheld evidence + manifest
+  → selected process HTML → verified evidence batches → text API
+  → schema checks → scoped exact citations → answer or abstention
+  → original cited screenshot displayed locally
+```
 
-Images are evidence for human inspection. No image pixels, data URLs, attachments,
-or image paths go to the LLM. A text-only model cannot read commands or states that
-exist solely inside screenshots. There is no OCR. Native terminal image display
-does not change the model's capabilities.
+`cli.py` manages prompts, options, disclosure, terminal rendering and process selection. `ocr.py` runs Tesseract and parses its TSV output. `pipeline.py` owns extraction, segmentation, provider requests, HTML export/verification, classification and chat. `requirements.txt` pins Python dependencies. `test_pipeline.py` contains offline regression tests; it does not establish model accuracy. The documentation website includes source snapshots for inspecting exact implementation details.
 
-The code validates identities, ownership, exact quotes and pages. It cannot prove
-that a classification or a paraphrase is semantically correct. Do not describe the
-system as having zero hallucinations or use model confidence as measured accuracy.
+## Installation and first run
 
-## 2. Setup from a clean machine
-
-Requirements: Python 3.10+, a terminal, and installed dependencies in
-`requirements.txt`. The code has been tested with the repository's Python 3.13
-virtual environment; other declared Python versions need their own compatibility
-checks. Network access is needed to install packages and for an approved model
-connection, but not for extraction or image viewing.
+Use a supported Python environment compatible with the pinned dependencies. Create a virtual environment and install `requirements.txt`. Install Tesseract separately: it is a system executable, not a pip package. On macOS use `brew install tesseract`; on Debian/Ubuntu install `tesseract-ocr` and the required language packages. For other platforms use the official Tesseract installation documentation. The default language is `eng`; additional languages require their traineddata files.
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python cli.py
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python cli.py --pdf '/path/to/document.pdf' --layout headers
 ```
 
-Windows activation/launch equivalent:
+Dragging a PDF into the terminal supplies its path; typing the path also works. The preview is local PDF metadata and extracted text, not an LLM summary. The system PDF viewer is optional. OCR availability is checked before provider configuration.
 
-```powershell
-py -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe cli.py
-```
-
-Run commands from the repository root. Output goes to `runs/` relative to the
-working directory. No user's Desktop, home directory, provider URL, or model ID is
-a required deployment path. PDF paths may be typed literally, quoted, or pasted
-using terminal drag/drop escaping. A directory is not an input PDF.
-
-First perform a local-only conversion:
+For local extraction and heading-based HTML export without API calls:
 
 ```sh
-.venv/bin/python cli.py --pdf '/path/to/evidence.pdf' --extract-only --no-browser
+python cli.py --pdf '/path/to/document.pdf' --layout headers --extract-only
 ```
 
-`--no-browser` exits after exports instead of entering the interactive document
-menu; it does not disable the earlier local preview. Review `source.html`,
-`withheld.html`, `furniture.html`, and `index.html` in the printed run directory.
-Use ordinary filesystem access controls for these files: they contain the PDF's
-text and images. Nothing encrypts them automatically.
+Use `--ocr off` only deliberately: screenshots then remain visible but their contents are unavailable to the text model. Direct Python callers of `extract()` must pass an OCR engine; its library default is no OCR.
 
-## 3. Configuration and provider onboarding
+## Packages and engine choice
 
-| Setting | Default and meaning |
+PyMuPDF reads PDF text, font sizes, bounding boxes and images, and normalizes images to PNG. `requests` performs HTTP requests. `jsonschema` validates provider outputs. `rich` renders the CLI. Standard-library HTML parsing, hashing, temporary files, CSV, JSON and subprocess support keep the implementation small. See the repository requirements for exact package pins.
+
+Tesseract runs locally with OEM 1, its LSTM recognition engine. This is neural OCR, **not** an LLM or SLM. No text-generation model repairs OCR results. Its TSV output supplies word scores and coordinates used by the application’s conservative filtering.
+
+Rust's `ocrs` is a plausible future backend, also using neural recognition rather than an LLM. Its project currently describes an early preview and Latin-alphabet support. The inspected CLI JSON exports text and geometry but no word-confidence fields equivalent to this implementation’s input. Replacing Tesseract would therefore require a deliberately revised uncertainty policy, model distribution and equivalent provenance support. Rust alone does not prove faster or more robust recognition; no comparative benchmark was performed on these PDFs. Tesseract is retained for this release.
+
+References: [ocrs project](https://github.com/robertknight/ocrs), [ocrs CLI output implementation](https://github.com/robertknight/ocrs/blob/main/ocrs-cli/src/output.rs), [Tesseract quality guidance](https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html), [Tesseract command usage](https://tesseract-ocr.github.io/tessdoc/Command-Line-Usage.html).
+
+## Configuration reference
+
+| Option | Meaning / default |
 | --- | --- |
-| PDF | Prompt or `--pdf`; one existing PDF |
-| API URL | Prompt; HTTPS base URL or full compatible chat URL |
-| Key | Hidden terminal prompt; retained in memory, never intentionally persisted |
-| Model | Prompt; exact provider ID or explicit router `auto` |
-| `--auth` | `bearer`; alternatively `api-key` header |
-| `--response-format` | `json_object`; alternatively strict `json_schema` |
-| `--url-type` | `auto`; `base` appends chat route, `chat` preserves full custom URL |
-| `--context-chars` | 24000 serialized message characters; minimum CLI value 4000 |
-| `--payload` | Optional JSON file with at least two distinct target strings |
-| `--extract-only` | No model configuration or requests |
-| `EVIDENCE_IMAGE_PROTOCOL` | Optional `kitty`, `iterm2`, or `none` override |
+| `--pdf` | One PDF path; interactive path prompt when omitted |
+| `--layout auto` | Use heading layout if recognized native process headings exist; otherwise legacy segmentation |
+| `--layout headers` | Require recognized native process headings; fail if none are found |
+| `--layout legacy` | Use legacy evidence sections / page-based model classification |
+| `--header-pattern` | Full-match regular expression with named `(?P<process>...)` capture |
+| `--ocr on` | Default; local OCR of extracted raster images |
+| `--ocr-language eng` | Installed language code, or combination such as `eng+deu` |
+| `--ocr-psm 6` | Segmentation mode; alternatives 3 and 11 |
+| `--ocr-min-confidence 60` | Minimum score for every word in an eligible line |
+| `--ocr-timeout 45` | Per-image timeout; accepted range 1–300 seconds |
+| `--tesseract tesseract` | Executable name or explicit executable path |
+| `--tessdata-dir` | Optional explicit language-data directory |
+| `--context-chars 24000` | Character budget, not token count; minimum 4000 |
+| `--payload` | Optional fixed-target JSON; otherwise discover identities |
+| `--auth` | `bearer` or `api-key` |
+| `--url-type` | `auto`, `base`, or `chat` for a full custom completion URL |
+| `--response-format` | `json_object` or `json_schema` |
+| `--extract-only` | Local extraction/export; no provider calls |
+| `--no-browser` | Exit after export instead of entering the interactive process browser |
 
-The character budget is not a token budget. Different languages, escaping, and
-models have different tokenization. Set it conservatively below the selected
-model's context capacity, allowing space for output. Increasing it does not grant
-the model a larger context window. The output allowance is 2048 tokens per call.
+For example, `--header-pattern '^Process name: (?P<process>[A-Za-z0-9_.-]+)$'` recognizes that exact native heading convention. A broad expression can incorrectly interpret a log line as a heading; configure it for the actual document format.
 
-Base URLs append `/chat/completions` without adding `/v1` implicitly. A URL already
-ending in `/chat/completions` is preserved. Query parameters remain after the path,
-including API version parameters. For a custom complete route, use `--url-type
-chat`. The catalog route is `/models` under the same base; a custom nonstandard
-chat URL cannot imply a model catalog, so supply an exact model ID.
+## Extraction and provenance
 
-The implemented wire protocol is OpenAI-compatible Chat Completions. A generic URL
-field does not implement native Anthropic Messages, Gemini generateContent,
-OpenAI Responses, or arbitrary proprietary protocols. Such APIs need a compatible
-gateway or a deliberately tested adapter. HTTPS can be remote; HTTP is accepted
-only for loopback addresses. Redirects, URL credentials, common secret query names,
-fragments, malformed ports and unsafe URL whitespace are rejected.
+Each input PDF has a SHA-256 digest. Each page, native text line, image and OCR line has a stable source-derived identifier. Named page slices preserve their original page numbers and validate filename page-count claims. Native lines retain font spans and PDF coordinates. PNG images retain source-page coordinates, byte counts and SHA-256 hashes. OCR lines reference their parent image and include pixel-coordinate boxes, word text, word scores, minimum score, mean score and eligibility.
 
-`/models` filters routes marked `needsKey`, `exhausted`, or equivalent execution
-status. Availability may still change after listing. `auto` only works if the
-configured service supports it. For a forwarding router, the key may be the
-router's unified key rather than its upstream provider's key. Never put real keys
-in shell arguments, examples, test fixtures, manifests, bug reports, or commits.
+The original normalized PNG is retained. OCR works on a temporary copy: flatten transparency against white, convert to grayscale, and invert predominantly dark images. This is a heuristic for screenshots, not a universal image enhancement algorithm. No identifier spelling, timestamp or missing word is guessed.
 
-## 4. Files and ownership
+Tesseract runs without a shell and with a per-image timeout. Languages and executable availability are checked first. Images above 25 megapixels and TSV output above 8 MB are rejected. These checks occur after relevant decoding or output generation; they are not a complete memory/disk sandbox. Invalid TSV coordinates or nonfinite scores fail extraction. Engine errors and timeouts do not silently become empty successful evidence.
 
-| File | Responsibility / likely maintainer changes |
-| --- | --- |
-| `pipeline.py` | Extraction, segmentation, HTML provenance, HTTP, classification, exports, chat |
-| `cli.py` | Input, local preview, progress, menus, terminal images and viewer launch |
-| `test_pipeline.py` | Real temporary PDF fixtures and mocked HTTP regressions |
-| `requirements.txt` | Reproducible pinned Python dependencies |
-| `targets.example.json` | Optional fixed-label payload format |
-| `README.md` | Short user entry point |
-| `HANDOFF.md` | Original brief and historical decisions |
-| `PYTHON_MAINTENANCE.md` | This technical operations guide |
-| `rust/` | Independent native implementation; see its own handover |
+An empty result is recorded as unreadable/no text. A line is eligible only if **every word** meets the threshold and it contains no prohibited invisible control/format characters. A single low-score “not” therefore withholds the entire line. All original lines remain visible for local inspection. Withheld lines enter model context only as an explicit unavailable-text placeholder and cannot be cited.
 
-There is no web server, database, scheduler, queue, vector store, model training,
-or background ingestion process. A run is local files plus in-memory application
-state. A second user should run their own process and output directory. Importing
-a manifest and resuming a prior Python run is not currently a CLI feature.
+A bounded in-memory LRU cache reuses results for byte-identical PNGs within one engine instance: at most 32 images and approximately 8 MB of serialized results. Each occurrence still has its own provenance. Repeated screenshots are not independent corroboration. There is no persistent cross-run cache or automatic model download.
 
-## 5. End-to-end execution and failure boundaries
+## Native heading ownership
 
-1. `main()` parses flags; `select_pdf()` normalizes and validates the path.
-2. `preview_pdf()` reads the first page locally. The shown excerpt is verbatim
-   extraction, not an AI summary. Graphics-capable terminals get a local thumbnail;
-   other interactive terminals offer the system viewer.
-3. `configure()` gathers endpoint, key and model, then asks for explicit consent.
-   No evidence request precedes that approval. Catalog requests also require it.
-4. `extract()` creates the run and image directory, validates PDF/page metadata,
-   hashes the file, extracts positioned units, calls `segment()`, and writes
-   `source.html` before classification starts.
-5. `export(..., state='not classified')` creates a reviewable local baseline.
-   All sections are withheld; this is not successful routing.
-6. `classify()` reads and validates `source.html`, routes eligible sections one at
-   a time, validates each result, and reports real completed section counts.
-7. Only complete valid decisions are passed to `export(..., state='complete')`.
-   It assembles source evidence into independent documents; the model never writes
-   or rewrites the HTML evidence.
-8. `browse()` lists processes, withheld evidence, index and decisions. A question
-   invokes `Chat.ask()` for the selected document. Images are resolved locally.
+`process_header()` accepts only native PDF text, not OCR text. Default conventions include explicit Process/Service/Runtime labels at sufficient font size and larger standalone identifiers containing a hyphen, underscore or dot. The custom pattern replaces default recognition when supplied. These are document-layout heuristics, not a universal semantic heading detector.
 
-A provider failure stops classification rather than producing a stream of false
-uncertain labels. The previous local baseline remains inspectable. A filesystem
-failure during export can leave partial files: exports are not transactional.
-Check `manifest.json` state and all referenced files; do not infer completeness
-from a directory existing. New runs use new timestamp directories, avoiding reuse
-of old successful output as if it belonged to a failed run.
+`segment_headers()` keeps a recognized process active across contiguous pages until a different process heading appears. Repeating the same heading does not reset its context. Material before the first heading is withheld. Page-family changes or page gaps reset ownership. A raster image whose bounding box intersects a recognized heading is withheld together with its OCR lines, because it may span an ownership boundary. This conservative geometry check does not detect every possible mixed-content image.
 
-## 6. Data model and provenance invariants
+Opening native text before the first image becomes header context. These anchors, including any native alias map, accompany later chat batches. Consequently a map on the first page need not disappear when a later screenshot is queried. Maps embedded only in earlier screenshots do not receive this special repetition; cross-batch alias questions may remain unresolved.
 
-`data` contains `sources`, `pages`, `sections`, and `furniture`. The manifest adds
-`state`, `targets`, `documents`, and `decisions`.
+Header ownership is deterministic: screenshot text cannot refile a section under a server mentioned in a log. Confidence 1 on this route means certainty about the chosen heading boundary, **not** certainty about the event or OCR. Exact repeated labels aggregate into one exported process. Case differences and similar identifiers remain distinct.
 
-- Source: filename, full SHA-256, starting original page, count, and family name.
-- Page: deterministic ID, original page number, source/family, width/height, units.
-- Text unit: ID, parent `block_id`, page/page ID/source, bounding box, text, spans.
-- Span: original text, rectangle, font size, flags and color.
-- Image unit: analogous provenance plus relative PNG path, no extracted text.
-- Section: ID based on its first unit, ordered units, and optional boundary note.
-- Decision: `section_id`, `status`, nullable `target`, confidence in [0,1], reason.
+## Legacy classification
 
-Example ID shape: `d<12 hex hash>-p0007-b003-l001`. `b003` is a PDF block and
-`l001` identifies a text line within it. A section adds `s-`. Image IDs generally
-end at the parent block. A file rewrite changes the hash even if its appearance
-is similar; IDs are not durable business identifiers across independently saved
-PDF versions. A `_pages_11-20.pdf` filename supplies original page offset 11 and
-must contain exactly ten pages. Without that convention, page numbering starts
-at one. The application cannot reconstruct omitted pages from a slice.
+Legacy segmentation recognizes existing evidence start/close markers and records interrupted or ambiguous boundaries. If no such markers exist, sections default to pages. The API discovers an exact process/entity label from text, or chooses among supplied fixed targets. It may return uncertain, mixed or unmatched evidence. Start and stop records should share the same identity.
 
-Every extracted unit must be owned by exactly one section or furniture. Furniture
-is an explicit allowlist of known headers/footers; repeated table rows are evidence
-and must not be dropped by a generic repetition heuristic. Source image paths
-must resolve inside this run's image directory before local display.
+Code verifies section identity, status/target consistency, supplied-target membership, and that a newly discovered label occurs exactly in usable evidence with identifier boundaries. It does not permit invented names. Model confidence is an estimate and is not an accuracy guarantee or a calibrated routing threshold. Heading-led client PDFs should normally use `--layout headers` to avoid accidental legacy fallback.
 
-HTML wrappers carry `id`, `data-section`, `data-block`, and `data-page`. Text is
-escaped; images are embedded as PNG data URLs for standalone copying. `read_html()`
-parses known wrappers and checks exact text, page and ownership against in-memory
-source provenance. It rejects missing, duplicate, foreign or modified evidence.
-Titles/CSS/image bytes are not context. This detects evidence mismatches, not
-malicious modification of the entire source-and-manifest trust base. Never treat
-arbitrary downloaded manifests as authenticated evidence.
+## Migration and hallucination edge cases
 
-## 7. Segmentation and classification policy
+| Case | Intended treatment | Mechanism and limit |
+| --- | --- | --- |
+| One heading, many image-only continuation pages | Keep all under the heading | Deterministic active-heading ownership |
+| Server A → server B | Record host placement separately from process ownership | Ownership enforced in code; event meaning interpreted by model |
+| Process A → process B | Resolve roles only from an explicit same-section map | Repeated native anchors + prompt rule; missing map remains unknown |
+| Header names source process A | Do not assume header is destination B | Role-sensitive prompt instruction |
+| Reverse process B → A | Preserve direction | Model reasoning; no deterministic event parser |
+| Server 2 versus server 20 | Keep identities distinct | Exact label checks and instructions |
+| Same aliases reused in another group | Do not borrow that group's mapping | Selected-process isolation; local-context instruction |
+| Approved/planned/dry-run transfer | Do not claim execution | Semantic prompt rule |
+| Partial migration or copied files | Do not claim full service migration | Semantic prompt rule |
+| Successful move followed by rollback | Respect chronology and later evidence | Semantic prompt rule; no global cross-batch reconciliation |
+| Start evidence without stop evidence | Answer supported part, state missing part | Multipart-answer instruction |
+| Conflicting same-time collectors | Report unresolved conflict / abstain | Prompt rule, not a contradiction solver |
+| Uploaded later, captured earlier | Use event/capture time appropriately | Prompt rule; unknown timezones not invented |
+| Redacted destination or absent alias map | Preserve unknowns | Prompt rule and abstention route |
+| “Ignore instructions” inside a log | Treat as evidence, never an instruction | Prompt separation; not a proof against all injection |
+| OCR reads O/0 or I/l/1 incorrectly | Do not silently normalize identifiers | No correction code; confidence gate cannot catch every error |
+| Duplicate screenshot | Do not count as two confirmations | Cache/hash metadata and model instruction |
+| Image intersects a heading | Withhold image and its OCR | Deterministic geometry quarantine |
+| Quote drops “not” from OCR line | Reject shortened OCR quote | Full-line OCR citation equality |
+| Low-confidence or invisible-control OCR | Retain locally, exclude usable text | Deterministic line gate |
+| Edited HTML or replaced screenshot | Stop before using inconsistent evidence | Provenance checks and image hashes |
 
-`is_heading()` recognizes explicit evidence headings and sufficiently large
-standalone Start/Stop headings. `segment()` carries open sections across contiguous
-pages and finishes at explicit close markers. Orphans, interrupted sections,
-missing pages and missing close markers receive boundary notes. If the document
-has no recognized heading anywhere, each page is an independent candidate.
+“Process B is the process named by this header” is accepted only if the document supplies that relationship. A heading alone identifies the owner of the section, not all roles mentioned within its images. This avoids tailoring logic to any synthetic example.
 
-Discovery sends ordinary boundary notes to the model for conservative assessment;
-missing/unrelated continuation pages remain locally withheld. Optional fixed-label
-mode withholds every ambiguous boundary before calling the model. A mixed page
-with separable recognized sections can be routed independently. An unmarked page
-containing inseparable different identities must be withheld as mixed. More robust
-column/layout analysis would be a future feature, not a reason to guess today.
+## HTML integrity and exported artifacts
 
-Discovery provides `known_groups` to encourage consistent names. An assigned label
-must occur exactly at an identifier boundary in source text, be printable, trimmed,
-and at most 200 characters. This prevents fabricated or partial identifiers but
-does not decide whether host, service or business process is the right grouping
-level. The model makes that choice. Review wrong groupings in the manifest before
-changing the segmentation rules.
+`source.html` is generated before classification. Export writes process HTML, withheld evidence, manifest and image references. HTML escapes source text and embeds PNG images. OCR transcripts are visible beneath the page with provenance labels. The manifest records source hashes, extraction settings and routing decisions; no API secret is stored.
 
-Statuses: `assigned` requires a valid target; `mixed`, `uncertain` and `unmatched`
-require null target. No duplicate assignment to two outputs is permitted. Confidence
-is displayed for review; there is no confidence threshold implying correctness.
+`read_html()` reads actual exported HTML and verifies expected IDs, section ownership, page references, exact text and OCR metadata against extraction provenance. Missing, duplicated, foreign or edited evidence fails instead of falling back to another process. For newly extracted images, embedded PNG encoding and digest are checked. Local PNGs are also checked when exporting or displaying a cited reference.
 
-## 8. Chat behavior and the reported failure
+Hashes detect changes relative to this run’s in-memory baseline. They do not authenticate a client document, prove its events happened, or protect against someone changing the baseline and artifacts together. Older manually constructed provenance without image hashes does not gain new image verification retroactively. Export is not transactional; an interrupted run can leave partial output. Do not treat an incomplete run as a completed report.
 
-The reported message was “Abstained: the selected evidence did not support a
-reliable answer,” for “has the process relay-44 started and stopped?” This message
-came from a schema-valid model response with `abstain: true`; it was not a network
-exception or an HTTP error. The previous code discarded the model's answer and
-showed a generic abstention. An unsupported model explanation must not become a
-trusted factual answer just because it is attached to an abstention.
+## Chat evidence and context budgets
 
-Offline inspection of the latest saved run found a group containing explicit stop
-records for two services, plus health/maintenance records, without an explicit start
-record. This explains why the old instruction to abstain when evidence was missing
-could suppress the entire multipart answer. It does not prove the live model's
-internal reason. A useful grounded answer confirms the documented stop and states
-that the supplied text does not establish the start; it does not infer “never
-started,” nor conflate multiple services under one host.
+The user selects a process, optionally a section, then asks a question. Its HTML is verified before any filtering. Histories are separate per process and selected section; recent conversation is not evidence. At most four turns are retained and history receives only a bounded share of the budget.
 
-The revised generic instruction answers supported parts of multipart questions,
-identifies unsupported parts, distinguishes services within a group, and does not
-regard start/stop at different times as inherently contradictory. It contains no
-special-case process names or operation-response shortcuts.
+The packer visits every selected evidence unit and creates bounded batches instead of truncating evidence silently. Native header anchors repeat where needed. The budget includes serialized request structure and reserves space for repair feedback; it is a character heuristic, not a provider token guarantee. A single oversized line or opening context causes an actionable error. Increase the budget only within the provider's actual context capacity, shorten the question, or clear history.
 
-Additional robustness changes:
+Answers from multiple batches are explicitly labelled. There is **no global event timeline or final cross-batch synthesis**. A later rollback in a different batch can therefore require human reconciliation. The notice warns that no cross-batch current-state conclusion has been verified. This is a material limitation, not evidence of full-document semantic consistency.
 
-- Every question re-reads only the selected process HTML and validates it.
-- Chat labels parent identifiers `parent_block_id`; citations should use text `id`.
-- A parent ID returned by a model can be normalized only when section, page and
-  exact quote identify exactly one text line in the current request. Ambiguity fails.
-- Invalid citation semantics get one bounded correction request. Invalid quotes,
-  foreign IDs or pages still cannot pass. Raw failed outputs are not printed.
-- Recent history is limited to four turns and at most one quarter of the budget.
-  If older history is omitted, the CLI tells the user; evidence is not omitted.
-- When the selected process is too large, every original unit is visited in bounded
-  batches. A section can be split at unit boundaries. Every request stays within
-  the configured serialized character budget and leaves room for corrections.
-- Batch answers are explicitly labeled, individually cited and displayed together.
-  They are not synthesized into an unsupported global conclusion. A missing fact
-  in one batch does not mean it is absent from other batches. Cross-batch conflicts
-  and chronology require reviewing the returned evidence; this is a deliberate
-  limitation of the small implementation.
-- Any invalid batch causes the entire question to abstain. API failures propagate
-  without presenting a partial result as success. No failed batch is silently skipped.
-- An individual huge line/question still produces an actionable budget error;
-  it is never silently truncated. Use `/clear`, a smaller question, or a suitable
-  higher budget. `/chunk N` remains an explicit smaller scope with separate history.
+## Guardrails enforced by code
 
-History keys are `(target, chunk)`. Different process chats, full process chat and
-section chat do not share histories. Answers and history are memory-only. All
-factual answers require nonempty validated citations. An image reference is never
-a valid quoted text citation. Abstaining outputs are replaced with local guidance
-rather than displaying unchecked assertions from the model.
+1. OCR eligibility uses minimum word confidence and invisible-control rejection; excluded text is not citeable.
+2. Native heading ownership and orphan/cross-heading quarantine prevent screenshot mentions from changing owners.
+3. HTML identity, text, metadata and image checks fail closed on inconsistencies.
+4. Provider JSON must satisfy the expected schema; duplicate keys, nonfinite values and unsafe decoded controls are rejected. Invalid structure receives one bounded repair attempt.
+5. A non-abstaining answer must be nonempty and have citations. Each citation must reference a current selected evidence line, its correct section and page, and a nonempty verbatim quotation.
+6. OCR quotations must equal the entire OCR line, preserving adjacent negation. Native text quotations may be exact substrings.
+7. A legacy parent-block ID is normalized only when exactly one supplied line matches; ambiguity is rejected.
+8. Citation failure receives one repair attempt. A still-invalid batch causes the whole question to abstain rather than returning partial success.
+9. Original cited OCR images are resolved through verified parent IDs and hashes. Native-text citations may use page-level image references, which are less precise.
 
-## 9. HTTP and structured result handling
+These checks constrain structure and provenance. They do not implement semantic entailment, deterministic alias reasoning, universal injection prevention, or a proof that every claim has supporting evidence. A model can quote a valid line and still misinterpret it. Full-line OCR quotations reduce selective quoting but cannot recover words the OCR engine omitted entirely.
 
-Only `Client` uses HTTP. `request()` enforces consent, allowed URLs, auth headers,
-no redirects, ten-second connection timeout and ninety-second read timeout.
-Requests has no application-level automatic retry here. Provider bodies and raw
-transport exceptions are suppressed to avoid exposing secrets or source text.
+## Provider connection and data disclosure
 
-`complete()` constructs system/user messages, embeds the JSON schema, requests a
-result instance, sets temperature zero and output limit 2048, then parses the
-Chat Completions envelope. A single enclosing JSON fence is tolerated. Arbitrary
-prose around JSON, nonfinite numbers, extra fields and wrong types are rejected.
-JSON/schema failure receives one correction; truncated output and transport errors
-do not. Chat citation repair is a separate semantic stage, so a batch can consume
-up to four HTTP completions when both repairs are needed. Classification gets at
-most two completions per eligible section. Budget checks precede each request.
+The supported protocol is OpenAI-compatible Chat Completions. Custom base URLs and full completion routes are supported; this does not imply native Anthropic/Gemini protocol compatibility. HTTPS is required except explicit loopback HTTP. Credentials in URLs, inappropriate query secrets, fragments and redirects are rejected. Authentication supports Bearer or api-key headers.
 
-## 10. Output and terminal operation
+Keys are entered hidden and kept in memory. The user approves disclosure before network activity. Native document text, eligible OCR text, labels, questions and selected-process history can reach the configured provider and its upstream services. Image pixels stay local. Temperature is 0 and response length is bounded, but deterministic model behavior is not guaranteed.
 
-| Artifact | Meaning |
-| --- | --- |
-| `source.html` | All converted evidence plus audited furniture |
-| `process-NN-<slug>.html` | Only the selected target's assigned original units |
-| `withheld.html` | Everything not assigned |
-| `furniture.html` | Explicitly recognized non-evidence text, retained for audit |
-| `index.html` | Links and classification decision table |
-| `manifest.json` | Full original provenance and decisions; no credentials |
-| `images/*.png` | Locally extracted image references |
+Requests have connection/read timeouts; there is no general automatic network retry. Schema repair and citation repair can together cause up to four completion requests per evidence batch. There is no document-wide spending cap or total wall-clock deadline. Provider errors are reported without exposing response bodies or tokens.
 
-Blank areas in a process HTML preserve source positioning where other evidence was
-removed. Text spans/raster images are retained; fonts, vector drawings, arbitrary
-rotations and complicated transforms are not guaranteed pixel-perfect.
+## Operations and troubleshooting
 
-Menu: number/name selects a group, `w` inspects withheld, `r` shows decisions, `i`
-opens index, `/ls` lists files. Within a group: `/evidence`, `/images [number or ID]`,
-`/html`, `/chunk N`, `/all`, `/clear`, `/back`, `/process`, `/help`, `/quit`.
-`/ls` uses Python filesystem listing; it does not execute untrusted shell strings.
+**Missing Tesseract/language:** install the executable and traineddata, verify PATH or supply explicit flags. Do not quietly disable OCR when screenshot contents are required.
 
-Ghostty/Kitty use Kitty graphics; iTerm2/WezTerm use OSC 1337. Redirected stdout and
-unsupported terminals receive paths instead. Multiplexers may block protocols;
-use a directly supported terminal or a deliberately configured override. Missing
-images produce local errors. Citation-associated images display after answers
-without sending pixels to the API. A successful escape write is not proof of
-visual display; verify on the actual user's terminal.
+**Wrong ownership:** inspect the native headings in source HTML. Prefer `--layout headers`, tighten the custom full-match pattern, and check font/layout conventions. Do not fix it by hardcoding a particular server name.
 
-## 11. Troubleshooting decision table
+**Abstained answer:** inspect `/evidence` and `/images`. Determine whether the relevant line is absent, low-confidence, in another process, lacks an alias mapping, or conflicts with other evidence. Check full OCR lines against the image, including “not”, timestamps and direction. Lowering confidence simply admits more uncertain text; it does not improve OCR.
 
-| Symptom | Check and recovery |
-| --- | --- |
-| Model abstains | `/evidence`: is the requested fact present as text in this selected group? Try a specific supported part. Check screenshots via `/images`. Review grouping and missing PDF slices. Do not remove validation to force answers. |
-| Unsupported/foreign citations | Confirm line IDs and exact quotes; one repair is automatic. Repeated failures suggest model/prompt compatibility; inspect a sanitized synthetic reproduction. |
-| Context budget error | `/clear`; shorten question; choose `/chunk N`; increase `--context-chars` only within actual model capacity. Check for exceptionally long individual lines. |
-| HTTP 401 / 403 | Check router versus provider key and `--auth`; verify access. Never print the key. |
-| HTTP 404 | Correct complete route, base prefix and exact model ID. |
-| HTTP 400 | Check structured response support, model parameters and context limits. Try the explicitly supported JSON mode. |
-| HTTP 429 | Stop; inspect quota/rate limits and retry later or choose available model. |
-| Redirect refused | Enter the final trusted endpoint directly. |
-| Network/TLS failure | Confirm endpoint, certificates, proxy and reachability; do not disable TLS checks. |
-| Truncated model output | Reduce scope or choose appropriate model/output capacity; inspect 2048-token setting in `complete()`. |
-| Invalid JSON/schema after repair | Provider may echo schema or add fields; use synthetic data to evaluate compatibility. |
-| HTML modified/missing/foreign | Reconvert source. Do not bypass integrity checks or use another process's HTML. |
-| Wrong groups | Inspect decisions and original text; adjust generic segmentation/prompt or provide explicit payload. |
-| All image-only pages withheld | Expected without OCR; add a tested local OCR stage only as a separate requirement. |
-| Image path but no graphic | Terminal/protocol limitation, not LLM failure; use compatible terminal or local viewer. |
-| Generic local failure | Check PDF validity, output write permission, disk, dependency versions; reproduce using synthetic fixture under a debugger without real keys. |
+**OCR text poorly recognized:** supply a clearer PDF or try an appropriate PSM and installed language. Current preprocessing does not deskew, rotate, detect handwriting or reconstruct tables semantically. Preserve the original and review changes before trusting results.
 
-Collect for an issue: version/commit, OS/Python, command flags without secrets,
-question, selected label, safe error text, source section/page IDs, run state and
-a sanitized small reproduction. Do not attach production PDFs, manifests or raw
-HTTP headers by default. Ask the owner which evidence can be shared.
+**Context error:** clear history, shorten the question or increase `--context-chars` responsibly. For multi-batch answers, inspect all batches before making a current-state claim.
 
-## 12. Tests and maintenance workflow
+**Citation rejection:** verify the model supports the structured response mode. OCR citations require complete single lines. Do not bypass validation to make an answer appear successful.
 
-```sh
-.venv/bin/python -B -m unittest -v test_pipeline
-.venv/bin/python test_pipeline.py --make-fixture /tmp/evidence-fixture.pdf
-```
+**HTML/image mismatch:** regenerate from the original PDF; do not disable integrity checks. The application is designed around current-run provenance, not arbitrary edited HTML or an unvalidated resume workflow.
 
-An earlier Python snapshot passed **44 tests**; the final allocation edits were not retested. Tests create actual PDFs in
-temporary directories and mock only HTTP. They cover
-mixed pages, cross-page sections, repeated rows, source offsets, all-block
-conservation, image ownership, real HTML export/read-back, modified/missing HTML,
-provider errors, authentication modes, URL/query composition, malformed JSON,
-schema errors, invalid IDs/status pairs, quotation validation, isolation, explicit
-chunk scope, batch coverage and history bounds. Graphics tests inspect protocol
-bytes, not a screenshot of terminal rendering. CLI tests prove automatic discovery
-has no target-name prompt. The mock oracle is test data, not a production classifier.
+**Terminal cannot display images:** terminal protocol support varies; use the exported HTML or system viewer. A text-only model cannot independently inspect the original screenshot.
 
-For a segmentation change, first create a PDF fixture showing the failing layout;
-assert every unit appears exactly once in sections/furniture and no process acquires
-foreign evidence. For a chat change, inspect serialized mock request bodies and
-assert no other process, image bytes or paths are sent. Include accepted and
-rejected citations, not just a golden successful response. For a provider change,
-mock HTTP errors/redirects and response envelopes before a live synthetic smoke test.
+## Limitations and planned improvements
 
-Run the full Python suite after shared backend edits. Record the exact test result,
-not a copied historical count. A passed mock suite does not establish live model
-accuracy. Live reproduction of the reported abstention requires the user's provider
-and approved synthetic/sanitized data; no key was available during this handover.
+Scanned headings are not trusted ownership boundaries. The application extracts embedded raster images; it does not OCR an entire rendered page or vector-only drawings. Multi-column reading order, tables, rotated text, decorative headings, headings without supported naming conventions and images containing multiple processes can be ambiguous. The automatic layout mode may select the wrong strategy. Missing pages not reflected in supplied numbering cannot be discovered automatically.
 
-## 13. Operations, upgrades, and next-intern checklist
+Confidence filtering may reject correct text and accept incorrect text. Low-quality negation, handwritten text, aliases inside prior screenshot batches, uncertain timezones and conflicting event records remain difficult. Current semantic safeguards are prompt instructions plus provenance validation, not a rules-based event engine.
 
-1. Start by reading the short README and this guide, then run all tests.
-2. Make one local extraction and inspect text, images, order, page numbering and
-   withheld boundaries against the original PDF.
-3. Use a controlled synthetic PDF with known outcomes for the first provider test.
-   Record model ID, response mode and reviewed expected answers without secrets.
-4. Test a compound question where one part is missing: confirm the supported part
-   is answered with quotes and the missing part is not invented.
-5. Test an unsupported question and foreign image/citation request: expect refusal.
-6. Check terminal graphics on the deployment terminal and fallback behavior.
-7. Measure extraction, export and model wait separately. Do not attribute network
-   latency to Python or assume a language rewrite improves provider responses.
-8. Review dependency upgrades one at a time. Keep pinned versions and regenerate
-   fixtures only intentionally; extraction changes can alter unit IDs/boundaries.
-9. Back up source PDFs and required run directories according to the organization's
-   policy. Delete old runs explicitly when permitted; the app has no retention job.
-10. Retain the previous code/environment for rollback; new code should use a new
-    run. Never mix old manifests with regenerated HTML or images.
+Future work should be explicitly scoped: reviewed scanned-header detection; typed event records with evidence citations; an alias graph scoped by section and time; deterministic chronology/rollback reconciliation; per-claim entailment review; an OCR adapter with equivalent provenance; controlled fixture evaluation; resource isolation and transactional export. None of these should be described as already implemented.
 
-Known extension points: local OCR with provenance, more general layout segmentation,
-explicit grouping-level configuration, resume/import validation, cross-batch
-synthesis with conflict verification, context token counting per model, safe
-structured diagnostics, measured accuracy evaluation, transactional exports, and
-controlled parallel classification for fixed targets. They are future work, not
-features to imply already exist. Keep the current minimal design until a measured
-problem warrants additional infrastructure.
+## Maintenance and handover
+
+Keep extraction provenance and exported HTML in sync when changing data fields. Update `read_html()` whenever export markup or OCR metadata changes. Preserve exact source text and parent image links. Add new layout conventions through the heading detector or explicit pattern, not client-name constants. Keep semantic prompt changes separate from enforceable validation so reviewers know what is guaranteed.
+
+Before a production release, an operator should run offline regression tests and inspect representative client documents, including low-quality scans, aliases, negation, partial transfers and rollbacks. Use fake providers for deterministic validation tests and a separately approved, budgeted model evaluation for answer quality. This update does not claim that these evaluations were performed.
+
+The published `documentation.html` is a standalone static page; `index.html` points to it for GitHub Pages. Keep this handbook, the website and source snapshots aligned when publishing. `ARCHITECTURE_NOTES.md` provides the shorter handwritten study version. The older documentation archive is historical and does not describe this release.
