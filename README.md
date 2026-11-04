@@ -29,8 +29,6 @@ Select a process to ask questions. Use `/evidence` to inspect text and `/images`
 
 ## Documentation
 
-- [Complete implementation handbook](PYTHON_MAINTENANCE.md)
-- [Handwritten architecture and guardrail notes](ARCHITECTURE_NOTES.md)
 - [Documentation website](https://adishram.github.io/Internship/)
 - `documentation.html`: standalone website with implementation source snapshots.
 
